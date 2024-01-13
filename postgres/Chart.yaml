@@ -1,0 +1,4 @@
+apiVersion: v1
+description: A Helm chart for quote service
+name: postgres-be
+version: 0.0.1

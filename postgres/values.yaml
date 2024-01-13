@@ -1,0 +1,8 @@
+db:
+  service:
+    type: ClusterIP
+  user: postgresadmin
+  password: admin123
+  name: testdb
+  pvc:
+    enabled: false

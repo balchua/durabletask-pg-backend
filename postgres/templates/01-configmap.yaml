@@ -1,0 +1,11 @@
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: pg-db-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernets.io/name: pg-db-config
+data:
+  POSTGRES_DB: {{ .Values.db.name }}
+  POSTGRES_USER: {{ .Values.db.user }}
+  PGGSSENCMODE: disable
