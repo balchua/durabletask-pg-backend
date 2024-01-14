@@ -1,4 +1,4 @@
-module github.com/balchua/durabletask-pg-backend
+module github.com/balchua/durabletask-pg-backend/lib
 
 go 1.21.5
 

@@ -852,7 +852,6 @@ func (be *postgresBackend) GetOrchestrationWorkItem(ctx context.Context) (*backe
 		}
 	}
 
-	be.logger.Errorf("****** ctid is %s **********", ctid)
 	// Proceed with update if lock acquired
 	row := tx.QueryRowContext(
 		ctx,

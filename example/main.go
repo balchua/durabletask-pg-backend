@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/balchua/durabletask-pg-backend/backend/postgres"
+	"github.com/balchua/durabletask-pg-backend/lib/backend/postgres"
 	"github.com/microsoft/durabletask-go/backend"
 	"github.com/microsoft/durabletask-go/task"
 )
