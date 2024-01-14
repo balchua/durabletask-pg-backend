@@ -26,15 +26,16 @@ var emptyString string = ""
 type postgresBackend struct {
 	connStr     string
 	host        string
-	port        int    // = 5432
-	user        string // = "postgres"
-	password    string //= "your-password"
-	dbname      string //= "calhounio_demo"
+	port        int
+	user        string
+	password    string
+	dbname      string
 	db          *sql.DB
 	workerName  string
 	logger      backend.Logger
 	initLock    sync.Mutex
 	initialized bool
+	maxConns    int
 
 	orchestrationLockTimeout time.Duration
 	activityLockTimeout      time.Duration
@@ -90,6 +91,12 @@ func WithDBName(dbName string) PostgresOption {
 	}
 }
 
+func WithMaxConnections(maxConns int) PostgresOption {
+	return func(be *postgresBackend) {
+		be.maxConns = maxConns
+	}
+}
+
 // NewPostgresBackend creates a new postgres-based Backend object.
 func NewPostgresBackend(opts ...PostgresOption) backend.Backend {
 	pid := os.Getpid()
@@ -105,6 +112,7 @@ func NewPostgresBackend(opts ...PostgresOption) backend.Backend {
 		logger:                   backend.DefaultLogger(),
 		orchestrationLockTimeout: 2 * time.Minute,
 		activityLockTimeout:      2 * time.Minute,
+		maxConns:                 10,
 	}
 
 	for _, opt := range opts {
@@ -135,6 +143,7 @@ func (be *postgresBackend) CreateTaskHub(ctx context.Context) error {
 		}
 		be.db = db
 	}
+	be.db.SetMaxOpenConns(be.maxConns)
 
 	if !be.initialized {
 		// Initialize database
@@ -817,38 +826,48 @@ func (be *postgresBackend) GetOrchestrationWorkItem(ctx context.Context) (*backe
 	now := time.Now().UTC()
 	newLockExpiration := now.Add(be.orchestrationLockTimeout)
 
-	// Place a lock on an orchestration instance that has new events that are ready to be executed.
-	row := tx.QueryRowContext(
-		ctx,
-		`UPDATE durabletask.Instances SET LockedBy = $1, LockExpiration = $2
-		WHERE ctid = (
-			SELECT ctid FROM durabletask.Instances I
-			WHERE (I.LockExpiration IS NULL OR I.LockExpiration < $3) AND EXISTS (
-				SELECT 1 FROM durabletask.NewEvents E
-				WHERE E.InstanceID = I.InstanceID AND (E.VisibleTime IS NULL OR E.VisibleTime < $4)
-			)
-			LIMIT 1
-		) RETURNING InstanceID`,
-		be.workerName,     // LockedBy for Instances table
-		newLockExpiration, // Updated LockExpiration for Instances table
-		now,               // LockExpiration for Instances table
-		now,               // VisibleTime for NewEvents table
+	stmt, err := tx.Prepare(`
+	SELECT ctid
+	FROM durabletask.Instances I
+	WHERE (I.LockExpiration IS NULL OR I.LockExpiration < $1) AND EXISTS (
+		SELECT 1 FROM durabletask.NewEvents E
+		WHERE E.InstanceID = I.InstanceID AND (E.VisibleTime IS NULL OR E.VisibleTime < $2)
 	)
-
-	if err := row.Err(); err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, fmt.Errorf("failed to query for orchestration work-items: %w", err)
+	LIMIT 1
+	FOR UPDATE SKIP LOCKED;  -- Acquire lock immediately skipping other locked items, return empty result if unavailable
+	`)
+	if err != nil {
+		return nil, err
 	}
 
+	defer stmt.Close()
+
+	var ctid string
+	err = stmt.QueryRowContext(ctx, now, now).Scan(&ctid)
+	if err != nil || ctid == "" {
+		if err == sql.ErrNoRows || ctid == "" {
+			return nil, backend.ErrNoWorkItems // No rows found, handle gracefully
+		} else {
+			return nil, fmt.Errorf("failed to query for orchestration work-items: %w", err) // Other error, propagate
+		}
+	}
+
+	be.logger.Errorf("****** ctid is %s **********", ctid)
+	// Proceed with update if lock acquired
+	row := tx.QueryRowContext(
+		ctx,
+		`UPDATE durabletask.Instances
+			SET LockedBy = $1, LockExpiration = $2
+			WHERE ctid = $3
+			RETURNING InstanceID`,
+		be.workerName, newLockExpiration, ctid,
+	)
 	var instanceID string
 	if err := row.Scan(&instanceID); err != nil {
 		if err == sql.ErrNoRows {
 			// No new events to process
 			return nil, backend.ErrNoWorkItems
 		}
-
 		return nil, fmt.Errorf("failed to scan the orchestration work-item: %w", err)
 	}
 
@@ -919,33 +938,45 @@ func (be *postgresBackend) GetActivityWorkItem(ctx context.Context) (*backend.Ac
 		return nil, err
 	}
 
+	tx, err := be.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
 	now := time.Now().UTC()
 	newLockExpiration := now.Add(be.activityLockTimeout)
-
-	row := be.db.QueryRowContext(
+	row := tx.QueryRowContext(
 		ctx,
-		`UPDATE durabletask.NewTasks SET LockedBy = $1, LockExpiration = $2, DequeueCount = DequeueCount + 1
-		WHERE SequenceNumber = (
-			SELECT SequenceNumber FROM durabletask.NewTasks T
-			WHERE T.LockExpiration IS NULL OR T.LockExpiration < $3
-			ORDER BY SequenceNumber ASC
-			LIMIT 1
-		) RETURNING SequenceNumber, InstanceID, EventPayload`,
-		be.workerName,
-		newLockExpiration,
+		`SELECT ctid FROM durabletask.NewTasks T
+		WHERE T.LockExpiration IS NULL OR T.LockExpiration < $1
+		ORDER BY SequenceNumber ASC
+		LIMIT 1
+		FOR UPDATE SKIP LOCKED;  -- Acquire lock immediately skipping other locked items, return empty result if unavailable`,
 		now,
 	)
+	var ctid string
 
-	if err := row.Err(); err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+	if err := row.Scan(&ctid); err != nil || ctid == "" {
+		if err == sql.ErrNoRows || ctid == "" {
+			return nil, backend.ErrNoWorkItems // No rows found, handle gracefully
+		} else {
+			return nil, fmt.Errorf("failed to query for orchestration work-items: %w", err) // Other error, propagate
 		}
-		return nil, fmt.Errorf("failed to query for activity work-items: %w", err)
 	}
 
+	be.logger.Errorf("****** ctid is %s **********", ctid)
 	var sequenceNumber int64
 	var instanceID string
 	var eventPayload []byte
+	// Proceed with update if lock acquired
+	row = tx.QueryRowContext(
+		ctx,
+		`UPDATE durabletask.NewTasks SET LockedBy = $1, LockExpiration = $2, DequeueCount = DequeueCount + 1
+		WHERE ctid = $3
+			RETURNING SequenceNumber, InstanceID, EventPayload`,
+		be.workerName, newLockExpiration, ctid,
+	)
 
 	if err := row.Scan(&sequenceNumber, &instanceID, &eventPayload); err != nil {
 		if ctx.Err() != nil {
@@ -959,9 +990,16 @@ func (be *postgresBackend) GetActivityWorkItem(ctx context.Context) (*backend.Ac
 	}
 
 	e := new(backend.HistoryEvent)
-	err := protojson.Unmarshal(eventPayload, e)
+	err = protojson.Unmarshal(eventPayload, e)
 	if err != nil {
 		return nil, err
+	}
+
+	if err = tx.Commit(); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("failed to update orchestration work-item: %w", err)
 	}
 
 	wi := &backend.ActivityWorkItem{
