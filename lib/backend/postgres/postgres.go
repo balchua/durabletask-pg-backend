@@ -964,7 +964,6 @@ func (be *postgresBackend) GetActivityWorkItem(ctx context.Context) (*backend.Ac
 		}
 	}
 
-	be.logger.Errorf("****** ctid is %s **********", ctid)
 	var sequenceNumber int64
 	var instanceID string
 	var eventPayload []byte
